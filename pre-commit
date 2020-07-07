@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# temp close, uncommented the line below:
+#exit 0
+
+# Exit on all errors.
+set -e
+
+# 测试时用0，正式改为1
+ERROR_EXIT_CODE=1
+
+# 图片文件
+MAX_PNG_SIZE=2048
+
+# PHP
+COMMAND='/usr/local/bin/phpcs --standard=PSR2 -n'
+COMMAND2='/usr/bin/php -l'
+
+# 临时文件夹
+TEMPDIR=`mktemp -d`
+
+# git 版本
+oldrev=$1
+newrev=$2
+refname=$3
+
+# git 提交
+# Commit sha with all zeros
+zero_commit='0000000000000000000000000000000000000000'
+
+# 日志
+LOG="/tmp/git.log"
+touch ${LOG}
+
+
+## 文件准备
+while read oldrev newrev refname; do
+    
+    # 找出修改过的文件 start
+    
+    # Get the file names, without directory, of the files that have been modified
+    # between the new revision and the old revision
+    files=`git diff --name-only ${oldrev} ${newrev}`
+
+    # Get a list of all objects in the new revision
+    objects=`git ls-tree --full-name -r ${newrev}`
+
+    # Iterate over each of these files
+    for file in ${files}; do
+
+        # Search for the file name in the list of all objects
+        object=`echo -e "${objects}" | egrep "(\s)${file}\$" | awk '{ print $3 }'`
+        
+        # If it's not present, then continue to the the next itteration
+        if [ -z ${object} ]; 
+        then 
+            continue; 
+        fi
+
+        # Otherwise, create all the necessary sub directories in the new temp directory
+        mkdir -p "${TEMPDIR}/`dirname ${file}`" &>/dev/null
+        # and output the object content into it's original file name
+        git cat-file blob ${object} > ${TEMPDIR}/${file}
+            
+    done;
+    # 找出修改过的文件 end
+    
+    
+    ## 注释 start   
+	msg_regex='【.+】.+[:：].+'
+    
+	# Branch or tag got deleted, ignore the push
+    if [ "$newrev" = "$zero_commit" ]; then
+      continue
+    fi
+
+    # Calculate range for new branch/updated branch
+    [ "$oldrev" = "$zero_commit" ] && range="$newrev" || range="$oldrev..$newrev"
+
+	for commit in $(git rev-list "$range" --not --all); do
+		if ! git log --max-count=1 --format=%B $commit | grep -iqE "$msg_regex"; then
+			echo "git提交注释格式: 【分支名】模块: 功能"
+			#exit ${ERROR_EXIT_CODE}
+		fi
+        #git log --max-count=1 --format=%B $commit
+	done
+    ## 注释 end  
+    
+    
+    # 不允许提交一些文件类型：https://github.com/github/platform-samples/blob/master/pre-receive-hooks/block_file_extensions.sh
+    excludeExisting="--not --all"
+    
+    # Check for new branch or tag
+    if [ "$oldrev" = "$zero_commit" ]; then
+      span=`git rev-list $newrev $excludeExisting`
+    else
+      span=`git rev-list $oldrev..$newrev $excludeExisting`
+    fi
+
+    for COMMIT in ${span};
+    do
+      for FILE  in `git log -1 --name-only --pretty=format:'' $COMMIT`;
+      do
+        case $FILE in
+        *.zip|*.gz|*.tgz|*.7z|*.rar|*.db|*.apk|*.ipa|*.mp4|*.flv|*.mp3 )
+          echo "文件类型限制：*.zip|*.gz|*.tgz|*.db|*.apk|*.ipa|*.mp4|*.flv|*.mp3不允许提交，请到https://erp.flowerplus.cn/erp_flower_order/imglist提交。"
+          #exit ${ERROR_EXIT_CODE}
+          ;;
+        esac
+      done
+    done
+    # 不允许提交一些文件类型 end
+done
+## 文件准备 end
+
+
+# PHP文件检查 start
+files_found=`find ${TEMPDIR} -name '*.php'`
+for fname in ${files_found}; do
+    CONTENT=`cat ${fname}`
+
+	# UTF-8无BOM格式
+    if echo "$CONTENT" | grep -q $'\xEF\xBB\xBF'; then
+      echo "请去除BOM符号, 设置为UTF-8无BOM格式 ${fname}" 1>&2
+      exit ${ERROR_EXIT_CODE}
+    fi
+
+	# tab符号要去掉
+    if [[ "${fname}" =~ \.(php|tpl|py)$ ]]; then
+      if echo "$CONTENT" | grep -q $'\t'; then
+        echo "php|tpl|py 请去除tab符号 ${fname}" 1>&2
+        exit ${ERROR_EXIT_CODE}
+      fi
+    fi
+    
+    # 语法错误：php -l 文件
+    ${COMMAND2} ${fname}
+    if [[ $? -ne 0 ]];
+    then
+      echo "语法错误 on ${fname}"
+      BAD_FILE=1
+    fi
+    
+    # 格式规范PSR2：phpcs --standard=PSR2 -n 文件 （自动修复方法：phpcbf --standard=PSR2 文件）
+    #${COMMAND} ${fname}
+    if [[ $? -ne 0 ]];
+    then
+      echo "格式规范PSR2 on ${fname}"
+      BAD_FILE=1
+    fi
+done;
+# PHP文件检查 end
+
+
+# 图片大小 start
+png_error_msg=""
+files_found=`find ${TEMPDIR} -name '*.png' -o -name "*.PNG"`
+for fname in ${files_found}; do
+	file ${fname}
+    # 检查文件大小
+    png_info=`file ${fname} | sed 's/,//g'`
+    png_width=`echo ${png_info} | awk '{print $5}' | bc`
+    png_height=`echo ${png_info} | awk '{print $7}' | bc`
+    if [[ ${png_width} -gt ${MAX_PNG_SIZE} ]] || [[ ${png_height} -gt ${MAX_PNG_SIZE} ]]; then
+      png_error_msg="${png_error_msg}\n${file_name} is too large: ${png_width} x ${png_height}"
+      echo "图片 error: ${png_error_msg}" >> ${LOG}
+      echo "图片限制大小：2048 x 2048: ${png_error_msg}" 1>&2
+      #exit ${ERROR_EXIT_CODE}
+    fi
+done;
+# 图片大小 end
+
+rm -rf ${TEMPDIR} &> /dev/null
+#echo ${TEMPDIR}
+
+if [[ $BAD_FILE -eq 1 ]]
+then
+  exit ${ERROR_EXIT_CODE}
+fi
+
+
+# 检查文件内容：秘钥和die，exit start
+# https://github.com/github/platform-samples/blob/master/pre-receive-hooks/block_confidentials.sh
+# ------------------------------------------------------------------------------
+# Variables
+# ------------------------------------------------------------------------------
+# Count of issues found in parsing
+found=0
+
+# Define list of REGEX to be searched and blocked
+regex_list=(
+  # block any private key file
+  '(\-){5}BEGIN\s?(RSA|OPENSSH|DSA|EC|PGP)?\s?PRIVATE KEY\s?(BLOCK)?(\-){5}.*'
+  # block AWS API Keys
+  'AKIA[0-9A-Z]{16}'
+  # block AWS Secret Access Key (TODO: adjust to not find validd Git SHA1s; false positives)
+  # '([^A-Za-z0-9/+=])?([A-Za-z0-9/+=]{40})([^A-Za-z0-9/+=])?'
+  # block confidential content
+  'CONFIDENTIAL'
+  'die'
+  'exit'
+)
+
+# Concatenate regex_list
+separator="|"
+regex="$( printf "${separator}%s" "${regex_list[@]}" )"
+# remove leading separator
+regex="${regex:${#separator}}"
+
+# ------------------------------------------------------------------------------
+# Pre-receive hook
+# ------------------------------------------------------------------------------
+while read oldrev newrev refname; do
+  # # Debug payload
+  # echo -e "${oldrev} ${newrev} ${refname}\n"
+
+  # ----------------------------------------------------------------------------
+  # Get the list of all the commits
+  # ----------------------------------------------------------------------------
+
+  # Check if a zero sha
+  if [ "${oldrev}" = "${zero_commit}" ]; then
+    # List everything reachable from newrev but not any heads
+    span=`git rev-list $(git for-each-ref --format='%(refname)' refs/heads/* | sed 's/^/\^/') ${newrev}`
+  else
+    span=`git rev-list ${oldrev}..${newrev}`
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Iterate over all commits in the push
+  # ----------------------------------------------------------------------------
+  for sha1 in ${span}; do
+    # Use extended regex to search for a match
+    match=`git diff-tree -r -p --no-color --no-commit-id --diff-filter=D ${sha1} | grep -nE "(${regex})"`
+
+    # Verify its not empty
+    if [ "${match}" != "" ]; then
+      # # Debug match
+      # echo -e "${match}\n"
+
+      found=$((${found} + 1))
+    fi
+  done
+done
+
+# ------------------------------------------------------------------------------
+# Verify count of found errors
+# ------------------------------------------------------------------------------
+if [ ${found} -gt 0 ]; then
+  # Found errors, exit with error
+  echo "秘钥和die，exit不允许提交。"
+  exit ${ERROR_EXIT_CODE}
+fi
+# 检查文件内容 end
+
+
+exit 1
